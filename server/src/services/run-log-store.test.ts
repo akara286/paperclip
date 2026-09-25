@@ -84,6 +84,27 @@ describe("createDurableRunLogStore", () => {
     expect(calls.get).toBe(0); // local file present -> no S3 read
   });
 
+  it("retries a transient Windows log-file lock without losing or duplicating the event", async () => {
+    const store = createDurableRunLogStore({ basePath: baseDir });
+    const handle = await store.begin(begin);
+    const realAppend = fs.appendFile.bind(fs);
+    let attempts = 0;
+    const appendSpy = vi.spyOn(fs, "appendFile").mockImplementation(async (file, data, options) => {
+      attempts++;
+      if (attempts === 1) throw Object.assign(new Error("temporary lock"), { code: "EBUSY", syscall: "open" });
+      await realAppend(file, data, options);
+    });
+    try {
+      await store.append(handle, { stream: "stdout", chunk: "one event", ts: "t1" });
+    } finally {
+      appendSpy.mockRestore();
+    }
+    expect(attempts).toBe(2);
+    const lines = (await store.read(handle)).content.trim().split("\n");
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!).chunk).toBe("one event");
+  });
+
   it("uploads the complete log to S3 on finalize", async () => {
     const { provider, objects, calls } = createMemoryProvider();
     const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider, keyPrefix: "run-logs" } });

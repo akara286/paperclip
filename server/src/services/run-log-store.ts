@@ -61,6 +61,24 @@ function normalizeKeyPrefix(prefix: string | undefined): string {
   return prefix.trim().replace(/^\/+/, "").replace(/\/+$/, "");
 }
 
+async function appendLocalLine(filePath: string, line: string): Promise<void> {
+  // Windows can briefly deny an open while another process reads the live log.
+  // Losing the model run over a transient log-file lock is worse than delaying
+  // the next log event for a couple of seconds. Keep other errors immediate.
+  const delaysMs = [25, 50, 100, 200, 400, 800, 800];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fs.appendFile(filePath, line, "utf8");
+      return;
+    } catch (error) {
+      const cause = error as NodeJS.ErrnoException;
+      // Retry only an open failure, before any bytes could have been appended.
+      if (cause.code !== "EBUSY" || cause.syscall !== "open" || attempt >= delaysMs.length) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delaysMs[attempt]));
+    }
+  }
+}
+
 export interface DurableRunLogStoreOptions {
   basePath: string;
   // When provided, completed logs are mirrored to object storage on finalize and
@@ -301,7 +319,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
       });
       const persisted = `${line}\n`;
-      await fs.appendFile(absPath, persisted, "utf8");
+      await appendLocalLine(absPath, persisted);
       noteInflightAppend(handle.logRef);
       return Buffer.byteLength(persisted, "utf8");
     },
