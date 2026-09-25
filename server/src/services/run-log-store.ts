@@ -118,6 +118,9 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
   const s3 = options.s3;
   const s3Prefix = normalizeKeyPrefix(s3?.keyPrefix);
   const inflightMirrorMs = s3?.inflightMirrorMs && s3.inflightMirrorMs > 0 ? s3.inflightMirrorMs : 0;
+  // Stdout and stderr can append concurrently. Keep their call order even if
+  // an earlier append waits for a transient Windows file lock.
+  const pendingAppends = new Map<string, Promise<void>>();
 
   function s3Key(logRef: string): string {
     return s3Prefix ? `${s3Prefix}/${logRef}` : logRef;
@@ -319,13 +322,24 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
       });
       const persisted = `${line}\n`;
-      await appendLocalLine(absPath, persisted);
-      noteInflightAppend(handle.logRef);
+      const previous = pendingAppends.get(handle.logRef) ?? Promise.resolve();
+      const append = previous.then(async () => {
+        await appendLocalLine(absPath, persisted);
+        noteInflightAppend(handle.logRef);
+      });
+      // A failed append must not poison the queue for later events.
+      const settled = append.then(() => {}, () => {});
+      pendingAppends.set(handle.logRef, settled);
+      void settled.then(() => {
+        if (pendingAppends.get(handle.logRef) === settled) pendingAppends.delete(handle.logRef);
+      });
+      await append;
       return Buffer.byteLength(persisted, "utf8");
     },
 
     async finalize(handle) {
       if (handle.store !== "local_file") return { bytes: 0, compressed: false };
+      await pendingAppends.get(handle.logRef);
       await retireInflightMirror(handle.logRef);
       const absPath = resolveWithin(basePath, handle.logRef);
       const stat = await fs.stat(absPath).catch(() => null);
